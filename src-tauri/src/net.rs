@@ -582,7 +582,7 @@ pub async fn edge(
                 Err("重定向次数超过限制".into())
             }.await;
             crate::playback_log::record("api.end", json!({
-                "request": request, "attempt": attempt, "operation": operation, "method": method,
+                "request": request, "attempt": attempt, "operation": operation, "method": method_name,
                 "line_host": line_host, "target_host": target_host, "status": status_code,
                 "headers_ms": headers_ms, "elapsed_ms": started.elapsed().as_millis() as u64,
                 "response_kind": response_kind, "gateway": gateway,
