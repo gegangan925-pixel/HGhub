@@ -1,7 +1,7 @@
 //! 网络层：与上游站点对话。
 //!
-//! 站点把全部 `/api/**` 调用收敛成 `POST /api/edge/request` 的信封，
-//! 我们只实现这一个入口，其余接口都是「填 path」。
+//! 站点 2026-11 更新后停用了 `/api/edge/request` 信封（一律 400「请求无法处理」），
+//! 公开的 REST 接口仍然可用，因此各业务接口按其 path 直连。
 //!
 //! # 代理（用户反馈「浏览器能开、HGhub 打不开」的根因就在这里）
 //!
@@ -20,8 +20,6 @@
 //! `net_diag` 命令会输出 DNS/HTTP/环境变量快照。
 
 use crate::network_policy;
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine;
 use once_cell::sync::Lazy;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -483,21 +481,13 @@ pub async fn edge(
     {
         return Err("镜像线路仅供游客浏览；登录/注册请切换到固定线路".into());
     }
-    let (encoded, ctype) = match &body {
-        Some(v) => (
-            B64.encode(serde_json::to_vec(v).map_err(|e| e.to_string())?),
-            "application/json",
-        ),
-        None => (String::new(), ""),
+    let payload = match &body {
+        Some(v) => Some(serde_json::to_vec(v).map_err(|e| e.to_string())?),
+        None => None,
     };
-    let envelope = json!({
-        "method": method,
-        "path": path,
-        "body": encoded,
-        "content_type": ctype,
-    });
+    let method = reqwest::Method::from_bytes(method.as_bytes()).map_err(|_| "请求方法无效")?;
 
-    let url = format!("{cur}/api/edge/request");
+    let url = format!("{cur}{path}");
     let referer = format!("{cur}/");
     let token = token.map(|s| s.to_string());
 
@@ -510,21 +500,25 @@ pub async fn edge(
         .to_string();
     let operation = edge_operation(path);
     let mut attempt = 0;
-    let guest_get = method.eq_ignore_ascii_case("GET") && body.is_none() && token.is_none();
+    let is_get = method == reqwest::Method::GET;
+    let is_post = method == reqwest::Method::POST;
+    let guest_get = is_get && body.is_none() && token.is_none();
     // 取播放地址的 POST 没有副作用，和 GET 一样允许重试
-    let can_retry = (method.eq_ignore_ascii_case("GET") && body.is_none())
-        || (method.eq_ignore_ascii_case("POST") && operation == "play");
+    let can_retry = (is_get && body.is_none()) || (is_post && operation == "play");
+    let method_name = method.as_str().to_string();
     let value = with_retry(can_retry, || {
         attempt += 1;
         let attempt = attempt;
-        let envelope = envelope.clone();
+        let method = method.clone();
+        let payload = payload.clone();
         let token = token.clone();
         let url = url.clone();
         let referer = referer.clone();
         let line_host = line_host.clone();
+        let method_name = method_name.clone();
         async move {
             let started = Instant::now();
-            crate::playback_log::record("api.begin", json!({"request": request, "attempt": attempt, "operation": operation, "method": method, "line_host": line_host}));
+            crate::playback_log::record("api.begin", json!({"request": request, "attempt": attempt, "operation": operation, "method": method_name, "line_host": line_host}));
             let mut status_code = None;
             let mut headers_ms = None;
             let mut target_host = line_host.clone();
@@ -536,10 +530,14 @@ pub async fn edge(
                     let (target, client) = client_for(next.as_str()).await?;
                     target_host = target.host_str().unwrap_or("").to_string();
                     let mut req = client
-                        .post(target.clone())
+                        .request(method.clone(), target.clone())
                         .header("Accept", "application/json")
-                        .header("Referer", &referer)
-                        .json(&envelope);
+                        .header("Referer", &referer);
+                    if let Some(bytes) = payload.as_ref() {
+                        req = req
+                            .header("Content-Type", "application/json")
+                            .body(bytes.clone());
+                    }
                     if let Some(t) = token.as_deref() {
                         if !t.is_empty() {
                             req = req.header("Authorization", format!("Bearer {t}"));
@@ -552,7 +550,7 @@ pub async fn edge(
                     let ctype = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
                     response_kind = if ctype.contains("json") { "json" } else if ctype.contains("html") { "html" } else { "other" };
                     gateway = if resp.headers().contains_key("x-amz-cf-id") { "cloudfront" } else if resp.headers().contains_key("cf-ray") { "cloudflare" } else { "other" };
-                    // 逐跳重建并检查客户端；不自动把信封 POST 改成无信封 GET。
+                    // 逐跳重建并检查客户端，不跟随到未经检查的目标。
                     if status.is_redirection() {
                         if hop == 5 {
                             return Err("重定向次数超过限制".into());
